@@ -1,0 +1,10 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary & extracted archive files
+tarang-ref/
+*.zip
+
+# Reference media
+*.mp4

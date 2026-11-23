@@ -1,0 +1,167 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Air Harp</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ddd;font:14px system-ui;overflow:hidden}
+#stage{position:relative;width:100vw;height:100vh}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;transform:scaleX(-1)}
+video{opacity:.55}
+#ui{position:fixed;left:12px;top:10px;z-index:5;line-height:1.6;text-shadow:0 0 4px #000}
+#go{position:fixed;inset:0;margin:auto;width:200px;height:56px;z-index:6;font-size:18px;border-radius:12px;border:0;background:#7cf;cursor:pointer}
+</style></head>
+<body>
+<div id="stage"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div id="ui">Pinch (thumb+index) &rarr; drag &rarr; release = string<br>Open hand, swipe index/middle finger across string = pluck<br>Z undo &middot; C clear</div>
+<button id="go">Start Air Harp</button>
+<script type="module">
+import {HandLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const $=id=>document.getElementById(id);
+const video=$('v'),cv=$('c'),ctx=cv.getContext('2d');
+let W=1280,H=720,ac,hl,lastT=-1,strings=[],sparks=[];
+const hands={},prevTip={};
+const PENT=[0,2,4,7,9],cache={};
+const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+
+// Karplus-Strong plucked string
+function ks(midi){
+  if(cache[midi])return cache[midi];
+  const sr=ac.sampleRate,f=440*2**((midi-69)/12),N=Math.max(2,Math.round(sr/f)),len=sr*3;
+  const b=ac.createBuffer(1,len,sr),d=b.getChannelData(0);
+  const ring=Float32Array.from({length:N},()=>Math.random()*2-1);
+  let p=0;
+  for(let i=0;i<len;i++){const n=(p+1)%N;d[i]=ring[p];ring[p]=(ring[p]+ring[n])*0.4985;p=n;}
+  return cache[midi]=b;
+}
+function play(midi,vel){
+  const s=ac.createBufferSource(),g=ac.createGain();
+  s.buffer=ks(midi);g.gain.setValueAtTime(vel*0.6,ac.currentTime);
+  g.gain.linearRampToValueAtTime(0,ac.currentTime+2.8);
+  s.connect(g).connect(ac.destination);s.start();
+}
+// longer string = lower note, snapped to C-major pentatonic
+function noteFor(L){
+  let semis=Math.min(36,Math.max(0,12*Math.log2(W*0.8/L)));
+  const oct=Math.floor(semis/12),r=semis-oct*12;
+  let deg=PENT.concat(12).reduce((a,b)=>Math.abs(b-r)<Math.abs(a-r)?b:a);
+  return 48+oct*12+deg;
+}
+function segInt(p1,p2,p3,p4){
+  const d=(p2.x-p1.x)*(p4.y-p3.y)-(p2.y-p1.y)*(p4.x-p3.x);
+  if(!d)return null;
+  const t=((p3.x-p1.x)*(p4.y-p3.y)-(p3.y-p1.y)*(p4.x-p3.x))/d;
+  const u=((p3.x-p1.x)*(p2.y-p1.y)-(p3.y-p1.y)*(p2.x-p1.x))/d;
+  return t>=0&&t<=1&&u>=0&&u<=1?{x:p1.x+t*(p2.x-p1.x),y:p1.y+t*(p2.y-p1.y)}:null;
+}
+function addString(a,b){
+  const L=dist(a,b),midi=noteFor(L);
+  strings.push({a,b,L,midi,hue:(midi-48)*8%360,vib:0,last:0});
+}
+function spark(p,n,hue){
+  for(let i=0;i<n;i++){const an=Math.random()*6.28,sp=2+Math.random()*7;
+    sparks.push({x:p.x,y:p.y,vx:Math.cos(an)*sp,vy:Math.sin(an)*sp-2,life:1,hue});}
+}
+function handle(lms){
+  const now=performance.now();
+  Object.keys(hands).forEach(k=>{if(+k>=lms.length){delete hands[k];delete prevTip[k];}});
+  lms.forEach((l,i)=>{
+    const P=j=>({x:l[j].x*W,y:l[j].y*H});
+    const th=P(4),ix=P(8),scale=dist(P(0),P(9));
+    const mid={x:(th.x+ix.x)/2,y:(th.y+ix.y)/2},d=dist(th,ix);
+    const st=hands[i]||(hands[i]={pin:false,l});
+    st.l=l;
+    const pinch=st.pin?d<scale*0.5:d<scale*0.3;
+    if(pinch&&!st.pin){st.start=mid;}
+    if(pinch)st.cur=mid;
+    if(!pinch&&st.pin&&dist(st.start,st.cur)>80)addString(st.start,st.cur);
+    st.pin=pinch;
+    // pluck with index + middle fingertips (only when not pinching)
+    const tips=[8,12].map(P);
+    const prev=prevTip[i];
+    if(prev&&!pinch){
+      tips.forEach((t,k)=>{
+        strings.forEach(s=>{
+          const hit=segInt(prev[k],t,s.a,s.b);
+          if(hit&&now-s.last>130){
+            s.last=now;
+            const vel=Math.min(1,Math.max(0.25,dist(prev[k],t)/45));
+            s.vib=vel;play(s.midi,vel);spark(hit,Math.round(10+vel*30),s.hue);
+          }
+        });
+      });
+    }
+    prevTip[i]=tips;
+  });
+}
+function draw(){
+  const now=performance.now();
+  ctx.clearRect(0,0,W,H);
+  // strings
+  strings.forEach(s=>{
+    s.vib*=0.95;if(s.vib<0.01)s.vib=0;
+    const dx=s.b.x-s.a.x,dy=s.b.y-s.a.y,L=s.L,nx=-dy/L,ny=dx/L;
+    ctx.save();
+    ctx.strokeStyle=`hsl(${s.hue},100%,${75+s.vib*20}%)`;
+    ctx.shadowColor=`hsl(${s.hue},100%,60%)`;ctx.shadowBlur=4+s.vib*28;
+    ctx.lineWidth=1.5+s.vib*3;
+    ctx.beginPath();
+    for(let i=0;i<=40;i++){
+      const t=i/40,off=Math.sin(Math.PI*t)*s.vib*28*Math.sin(now*0.06+t*9);
+      const x=s.a.x+dx*t+nx*off,y=s.a.y+dy*t+ny*off;
+      i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+    }
+    ctx.stroke();
+    ctx.shadowBlur=0;ctx.lineWidth=1;ctx.strokeStyle='rgba(255,255,255,.7)';
+    ctx.beginPath();
+    for(let i=1;i<16;i++){const t=i/16,x=s.a.x+dx*t,y=s.a.y+dy*t,h=i%4?4:8;
+      ctx.moveTo(x-nx*h,y-ny*h);ctx.lineTo(x+nx*h,y+ny*h);}
+    ctx.stroke();
+    [s.a,s.b].forEach(p=>{ctx.beginPath();ctx.arc(p.x,p.y,5,0,6.28);ctx.stroke();});
+    ctx.restore();
+  });
+  // sparks
+  ctx.lineWidth=2;
+  sparks=sparks.filter(p=>p.life>0);
+  sparks.forEach(p=>{
+    p.x+=p.vx;p.y+=p.vy;p.vy+=0.25;p.life-=0.03;
+    ctx.strokeStyle=`hsla(${p.hue},100%,80%,${p.life})`;
+    ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(p.x-p.vx*1.5,p.y-p.vy*1.5);ctx.stroke();
+  });
+  // hands + pinch preview
+  Object.values(hands).forEach(st=>{
+    const l=st.l;
+    ctx.strokeStyle='#2f2';ctx.lineWidth=3;
+    CONN.forEach(([a,b])=>{ctx.beginPath();ctx.moveTo(l[a].x*W,l[a].y*H);ctx.lineTo(l[b].x*W,l[b].y*H);ctx.stroke();});
+    ctx.fillStyle='#e22';
+    l.forEach(p=>{ctx.beginPath();ctx.arc(p.x*W,p.y*H,4,0,6.28);ctx.fill();});
+    if(st.pin){
+      ctx.save();ctx.setLineDash([8,8]);ctx.strokeStyle='#fff';ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(st.start.x,st.start.y);ctx.lineTo(st.cur.x,st.cur.y);ctx.stroke();ctx.restore();
+    }
+  });
+}
+function frame(){
+  if(video.readyState>=2&&video.currentTime!==lastT){
+    lastT=video.currentTime;
+    handle(hl.detectForVideo(video,performance.now()).landmarks);
+  }
+  draw();requestAnimationFrame(frame);
+}
+addEventListener('keydown',e=>{
+  if(e.key==='c'||e.key==='C')strings=[];
+  if(e.key==='z'||e.key==='Z')strings.pop();
+});
+$('go').onclick=async()=>{
+  $('go').textContent='Loading...';
+  ac=new AudioContext();
+  video.srcObject=await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720}});
+  await video.play();
+  W=cv.width=video.videoWidth;H=cv.height=video.videoHeight;
+  const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  hl=await HandLandmarker.createFromOptions(fs,{
+    baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
+    runningMode:'VIDEO',numHands:2});
+  $('go').remove();frame();
+};
+</script>
+</body></html>
