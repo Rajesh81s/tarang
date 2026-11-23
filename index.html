@@ -11,17 +11,19 @@
     html, body { height: 100%; background: #000; color: #ccc; font: 13px/1.5 monospace; overflow: hidden; }
     #stage { position: relative; width: 100vw; height: 100vh; }
     video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; transform: scaleX(-1); }
-    video { opacity: 0.5; }
+    video { opacity: 0.4; }
+    /* Glow canvas sits on top for additive blending */
+    #glow { mix-blend-mode: screen; pointer-events: none; }
     #info {
       position: fixed; left: 10px; top: 8px; z-index: 5;
-      font-size: 12px; line-height: 1.7; color: #aaa;
-      text-shadow: 0 0 4px #000; pointer-events: none;
+      font-size: 11px; line-height: 1.7; color: #777;
+      text-shadow: 0 0 6px #000, 0 0 12px #000; pointer-events: none;
     }
     #note {
       position: fixed; right: 14px; top: 10px; z-index: 5;
-      font-size: 28px; font-weight: bold; color: #7cf;
-      text-shadow: 0 0 12px rgba(100,200,255,0.4);
-      opacity: 0; transition: opacity 0.15s; pointer-events: none;
+      font-size: 32px; font-weight: bold; color: #7cf;
+      text-shadow: 0 0 16px rgba(100,200,255,0.5), 0 0 40px rgba(100,200,255,0.2);
+      opacity: 0; transition: opacity 0.12s; pointer-events: none;
     }
     #note.show { opacity: 1; }
     #go {
@@ -38,6 +40,7 @@
 <div id="stage">
   <video id="v" playsinline muted></video>
   <canvas id="c"></canvas>
+  <canvas id="glow"></canvas>
 </div>
 
 <div id="info">
@@ -59,7 +62,7 @@
  * Plucking: open-hand fingertip swipe across a string.
  * Resizing: pinch near a string endpoint and drag to move it.
  *
- * Audio: Karplus-Strong plucked-string synthesis via Web Audio API.
+ * Audio: Karplus-Strong + delay echo via Web Audio API.
  * Vision: MediaPipe Hands (2 hands, GPU).
  */
 
@@ -69,18 +72,22 @@ import {
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 // ── DOM ──────────────────────────────────────────────────────
-const video   = document.getElementById('v');
-const canvas  = document.getElementById('c');
-const ctx     = canvas.getContext('2d');
-const noteEl  = document.getElementById('note');
+const video    = document.getElementById('v');
+const canvas   = document.getElementById('c');
+const glowCv   = document.getElementById('glow');
+const ctx      = canvas.getContext('2d');
+const gctx     = glowCv.getContext('2d');
+const noteEl   = document.getElementById('note');
 const statusEl = document.getElementById('status');
 
 // ── Constants ────────────────────────────────────────────────
 const PENT = [0, 2, 4, 7, 9];           // C-major pentatonic intervals
-const PLUCK_COOLDOWN = 150;              // ms per string
-const GRAB_RADIUS = 50;                  // px — how close to grab an endpoint
-const MAX_ACTIVE_SOURCES = 8;            // cap concurrent audio nodes to prevent freeze
-const SMOOTHING = 0.3;                   // landmark smoothing factor
+const PLUCK_COOLDOWN = 160;              // ms per string
+const GRAB_RADIUS = 55;                  // px for endpoint grabbing
+const MAX_ACTIVE_SOURCES = 10;           // cap concurrent audio nodes
+const SMOOTHING = 0.32;                  // landmark smoothing
+const MIN_STRING_LENGTH = 60;            // px — prevent tiny accidental strings
+const BOUNDARY_MARGIN = 15;              // px — clamp strings inside canvas
 
 // MediaPipe hand skeleton connections
 const CONN = [
@@ -91,44 +98,45 @@ const CONN = [
 
 // ── State ────────────────────────────────────────────────────
 let W = 1280, H = 720;
-let hl = null;                           // HandLandmarker
-let ac = null;                           // AudioContext
-let lastT = -1;
+let hl = null, ac = null, lastT = -1;
 let strings = [];
 let sparks = [];
-let smoothed = {};                       // per-hand smoothed landmarks
-let prevTips = {};                       // previous fingertip positions for pluck detection
+let ripples = [];            // pluck ripple effects
+let ambientDots = [];        // floating ambient particles
+let smoothed = {};
+let prevTips = {};
 let noteTimer = null;
-
-// Two-hand drawing state
-let drawing = false;                     // are both hands pinching to draw?
-let drawA = null;                        // left-hand pinch midpoint
-let drawB = null;                        // right-hand pinch midpoint
-
-// Grab-to-resize state
-let grabbing = null;                     // { stringIndex, endpoint: 'a'|'b' }
-
-// Active audio source tracking to prevent freeze
+let drawing = false;
+let drawA = null, drawB = null;
+let grabbing = null;
 let activeSources = 0;
+let lastHandCount = 0;       // track hand visibility
 
 // ── Utilities ────────────────────────────────────────────────
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const mid  = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
 
 function midiName(m) {
   const names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
   return names[m % 12] + (Math.floor(m / 12) - 1);
 }
 
+// Clamp a point inside canvas boundaries
+function clampPoint(p) {
+  return {
+    x: clamp(p.x, BOUNDARY_MARGIN, W - BOUNDARY_MARGIN),
+    y: clamp(p.y, BOUNDARY_MARGIN, H - BOUNDARY_MARGIN),
+  };
+}
+
 // ── Pitch mapping ────────────────────────────────────────────
-// Longer string → lower note, snapped to pentatonic scale.
 function noteFor(length) {
   const ref = W * 0.8;
-  let semis = clamp(12 * Math.log2(ref / length), 0, 36);
+  let semis = clamp(12 * Math.log2(ref / Math.max(length, 10)), 0, 36);
   const oct = Math.floor(semis / 12);
   const rem = semis - oct * 12;
-  // snap to nearest pentatonic degree
   let best = PENT[0], bestD = Math.abs(rem - best);
   for (const iv of PENT) {
     const d = Math.abs(rem - iv);
@@ -138,7 +146,7 @@ function noteFor(length) {
   return 48 + oct * 12 + (best >= 12 ? 12 : best);
 }
 
-// ── Segment intersection (for pluck detection) ───────────────
+// ── Segment intersection ─────────────────────────────────────
 function segHit(p1, p2, p3, p4) {
   const dx1 = p2.x - p1.x, dy1 = p2.y - p1.y;
   const dx2 = p4.x - p3.x, dy2 = p4.y - p3.y;
@@ -154,31 +162,61 @@ function segHit(p1, p2, p3, p4) {
 
 
 // ═══════════════════════════════════════════════════════════════
-//  AUDIO ENGINE — Karplus-Strong with source limiting
+//  AUDIO ENGINE — Karplus-Strong + Delay Echo
 // ═══════════════════════════════════════════════════════════════
 
 const noteCache = {};
+let delayNode = null;
+let delayGain = null;
+let masterGain = null;
+
+function initAudioGraph() {
+  ac = new AudioContext();
+
+  // Master gain
+  masterGain = ac.createGain();
+  masterGain.gain.value = 0.85;
+  masterGain.connect(ac.destination);
+
+  // Delay echo for spaciousness (lightweight alternative to convolution reverb)
+  delayNode = ac.createDelay(1.0);
+  delayNode.delayTime.value = 0.22;   // 220ms echo
+  delayGain = ac.createGain();
+  delayGain.gain.value = 0.25;        // echo volume
+
+  // Feedback loop: delay → gain → delay (creates fading repeats)
+  const feedbackGain = ac.createGain();
+  feedbackGain.gain.value = 0.3;
+
+  delayNode.connect(delayGain);
+  delayGain.connect(masterGain);
+  delayNode.connect(feedbackGain);
+  feedbackGain.connect(delayNode);
+}
 
 function ksBuffer(midi) {
   if (noteCache[midi]) return noteCache[midi];
   const sr = ac.sampleRate;
   const freq = 440 * Math.pow(2, (midi - 69) / 12);
   const N = Math.max(2, Math.round(sr / freq));
-  const len = sr * 2;  // 2 seconds (shorter = less memory)
+  const len = sr * 2.5;
   const buf = ac.createBuffer(1, len, sr);
   const data = buf.getChannelData(0);
 
-  // Delay line with filtered noise burst
+  // Delay line with shaped noise burst
   const ring = new Float32Array(N);
   for (let i = 0; i < N; i++) ring[i] = Math.random() * 2 - 1;
-  // Warm the attack
-  for (let i = 1; i < N; i++) ring[i] = 0.5 * ring[i] + 0.5 * ring[i - 1];
+  // Two-pass smoothing for warmer attack
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 1; i < N; i++) ring[i] = 0.5 * ring[i] + 0.5 * ring[i - 1];
+  }
 
+  // Karplus-Strong feedback loop
   let ptr = 0;
   for (let i = 0; i < len; i++) {
     const next = (ptr + 1) % N;
     data[i] = ring[ptr];
-    ring[ptr] = (ring[ptr] + ring[next]) * 0.498;
+    ring[ptr] = (ring[ptr] + ring[next]) * 0.4982;
     ptr = next;
   }
   noteCache[midi] = buf;
@@ -187,38 +225,45 @@ function ksBuffer(midi) {
 
 function playNote(midi, vel) {
   if (!ac || ac.state === 'closed') return;
-
-  // ── CRITICAL: prevent audio node accumulation freeze ──
   if (activeSources >= MAX_ACTIVE_SOURCES) return;
 
   const now = ac.currentTime;
   const src = ac.createBufferSource();
   const gain = ac.createGain();
 
-  src.buffer = ksBuffer(midi);
-  const volume = 0.2 + vel * 0.45;
-  gain.gain.setValueAtTime(volume, now);
-  gain.gain.exponentialRampToValueAtTime(0.001, now + 1.8);
+  // Velocity-sensitive filter: faster pluck = brighter tone
+  const filter = ac.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 1800 + vel * 6000;
+  filter.Q.value = 0.8;
 
-  src.connect(gain).connect(ac.destination);
+  src.buffer = ksBuffer(midi);
+  const volume = 0.15 + vel * 0.5;
+  gain.gain.setValueAtTime(volume, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 2.2);
+
+  src.connect(filter);
+  filter.connect(gain);
+  gain.connect(masterGain);    // dry path
+  gain.connect(delayNode);     // wet path (echo)
 
   activeSources++;
   src.onended = () => {
     activeSources--;
-    // Disconnect to free resources immediately
-    try { src.disconnect(); gain.disconnect(); } catch (_) {}
+    try { src.disconnect(); filter.disconnect(); gain.disconnect(); } catch (_) {}
   };
 
   src.start();
-  src.stop(now + 1.8);
+  src.stop(now + 2.2);
 }
 
 function showNote(name, hue) {
   noteEl.textContent = name;
-  noteEl.style.color = `hsl(${hue}, 90%, 75%)`;
+  noteEl.style.color = `hsl(${hue}, 90%, 78%)`;
+  noteEl.style.textShadow = `0 0 16px hsla(${hue},100%,60%,0.6), 0 0 40px hsla(${hue},100%,50%,0.25)`;
   noteEl.classList.add('show');
   clearTimeout(noteTimer);
-  noteTimer = setTimeout(() => noteEl.classList.remove('show'), 900);
+  noteTimer = setTimeout(() => noteEl.classList.remove('show'), 1000);
 }
 
 
@@ -227,24 +272,73 @@ function showNote(name, hue) {
 // ═══════════════════════════════════════════════════════════════
 
 function addString(a, b) {
+  a = clampPoint(a);
+  b = clampPoint(b);
   const L = dist(a, b);
-  if (L < 40) return null;  // too short
+  if (L < MIN_STRING_LENGTH) return null;
   const midi = noteFor(L);
-  const hue = ((midi - 48) * 25) % 360;
+  const hue = ((midi - 48) * 28) % 360;
   const s = {
     a: { ...a }, b: { ...b },
     L, midi, hue,
-    vib: 0,         // vibration amplitude
-    lastPluck: 0,   // pluck cooldown timestamp
+    vib: 0,
+    lastPluck: 0,
+    thickness: clamp(1.5 + (36 - (midi - 48)) * 0.08, 1, 3.5),  // lower = thicker
+    idlePhase: Math.random() * Math.PI * 2,  // gentle idle sway
   };
   strings.push(s);
   return s;
 }
 
 function updateStringProps(s) {
+  s.a = clampPoint(s.a);
+  s.b = clampPoint(s.b);
   s.L = dist(s.a, s.b);
   s.midi = noteFor(s.L);
-  s.hue = ((s.midi - 48) * 25) % 360;
+  s.hue = ((s.midi - 48) * 28) % 360;
+  s.thickness = clamp(1.5 + (36 - (s.midi - 48)) * 0.08, 1, 3.5);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  PARTICLES & EFFECTS
+// ═══════════════════════════════════════════════════════════════
+
+function emitSparks(pt, count, hue) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 9;
+    sparks.push({
+      x: pt.x, y: pt.y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 3,
+      life: 1, hue,
+      size: 0.8 + Math.random() * 2.5,
+    });
+  }
+}
+
+function emitRipple(pt, hue) {
+  ripples.push({
+    x: pt.x, y: pt.y,
+    radius: 5, maxRadius: 60 + Math.random() * 30,
+    life: 1, hue,
+  });
+}
+
+// Initialize ambient floating particles
+function initAmbient() {
+  for (let i = 0; i < 40; i++) {
+    ambientDots.push({
+      x: Math.random() * W,
+      y: Math.random() * H,
+      vx: (Math.random() - 0.5) * 0.3,
+      vy: (Math.random() - 0.5) * 0.3,
+      size: 0.5 + Math.random() * 1.5,
+      alpha: 0.1 + Math.random() * 0.2,
+      hue: Math.random() * 360,
+    });
+  }
 }
 
 
@@ -252,11 +346,11 @@ function updateStringProps(s) {
 //  LANDMARK SMOOTHING
 // ═══════════════════════════════════════════════════════════════
 
-function smoothLandmarks(raw, handIdx) {
-  const prev = smoothed[handIdx];
+function smoothLandmarks(raw, idx) {
+  const prev = smoothed[idx];
   if (!prev || prev.length !== raw.length) {
-    smoothed[handIdx] = raw.map(p => ({ x: p.x, y: p.y, z: p.z }));
-    return smoothed[handIdx];
+    smoothed[idx] = raw.map(p => ({ x: p.x, y: p.y, z: p.z }));
+    return smoothed[idx];
   }
   for (let j = 0; j < raw.length; j++) {
     prev[j].x = prev[j].x * SMOOTHING + raw[j].x * (1 - SMOOTHING);
@@ -272,14 +366,13 @@ function smoothLandmarks(raw, handIdx) {
 // ═══════════════════════════════════════════════════════════════
 
 function isPinching(lm, W, H) {
-  // Returns { pinching, mid } — whether thumb+index are pinched and their midpoint
   const thumb = { x: lm[4].x * W, y: lm[4].y * H };
   const index = { x: lm[8].x * W, y: lm[8].y * H };
   const wrist = { x: lm[0].x * W, y: lm[0].y * H };
   const mcp   = { x: lm[5].x * W, y: lm[5].y * H };
   const palmScale = dist(wrist, mcp);
   const pinchDist = dist(thumb, index);
-  const threshold = palmScale * 0.38;
+  const threshold = palmScale * 0.35;
   return {
     pinching: pinchDist < threshold,
     mid: mid(thumb, index),
@@ -290,37 +383,31 @@ function isPinching(lm, W, H) {
 function processHands(allLandmarks) {
   const now = performance.now();
 
-  // Clean up old smoothed data
   for (const k of Object.keys(smoothed)) {
     if (+k >= allLandmarks.length) delete smoothed[k];
   }
 
-  // Smooth all hands
   const hands = allLandmarks.map((raw, i) => {
     const lm = smoothLandmarks(raw, i);
     const pinch = isPinching(lm, W, H);
     return { lm, ...pinch };
   });
 
+  lastHandCount = hands.length;
+
   // ── TWO-HAND STRING DRAWING ────────────────────────────
   if (hands.length >= 2) {
     const h0 = hands[0], h1 = hands[1];
 
     if (h0.pinching && h1.pinching) {
-      // Both hands pinching → drawing or resizing
-      drawA = h0.mid;
-      drawB = h1.mid;
+      drawA = clampPoint(h0.mid);
+      drawB = clampPoint(h1.mid);
 
-      // Check if we should grab an existing endpoint instead of drawing new
       if (!drawing && grabbing === null) {
-        // Look for a nearby endpoint to grab
         let foundGrab = false;
         for (let si = 0; si < strings.length; si++) {
           const s = strings[si];
-          // Check if either pinch point is near an endpoint
-          for (const [pinchPt, otherPt, handLabel] of [
-            [h0.mid, h1.mid, 0], [h1.mid, h0.mid, 1]
-          ]) {
+          for (const [pinchPt, handLabel] of [[h0.mid, 0], [h1.mid, 1]]) {
             if (dist(pinchPt, s.a) < GRAB_RADIUS) {
               grabbing = { si, ep: 'a', hand: handLabel };
               foundGrab = true; break;
@@ -332,58 +419,47 @@ function processHands(allLandmarks) {
           }
           if (foundGrab) break;
         }
-
-        if (!foundGrab) {
-          drawing = true;
-        }
+        if (!foundGrab) drawing = true;
       }
 
-      // If grabbing, update the grabbed endpoint
       if (grabbing) {
         const s = strings[grabbing.si];
         if (s) {
           const grabHand = grabbing.hand === 0 ? h0.mid : h1.mid;
-          s[grabbing.ep] = { ...grabHand };
+          s[grabbing.ep] = clampPoint(grabHand);
           updateStringProps(s);
         }
       }
     } else {
-      // At least one hand released
       if (drawing && drawA && drawB) {
         const L = dist(drawA, drawB);
-        if (L > 40) {
+        if (L >= MIN_STRING_LENGTH) {
           const s = addString(drawA, drawB);
-          if (s) playNote(s.midi, 0.12);  // soft creation sound
+          if (s) playNote(s.midi, 0.1);
         }
       }
       drawing = false;
-      drawA = null;
-      drawB = null;
+      drawA = null; drawB = null;
       grabbing = null;
     }
   } else {
-    // Less than 2 hands visible
-    if (drawing && drawA && drawB && dist(drawA, drawB) > 40) {
+    if (drawing && drawA && drawB && dist(drawA, drawB) >= MIN_STRING_LENGTH) {
       addString(drawA, drawB);
     }
     drawing = false;
-    drawA = null;
-    drawB = null;
+    drawA = null; drawB = null;
     grabbing = null;
   }
 
-  // ── PLUCK DETECTION (open-hand finger swipe) ───────────
+  // ── PLUCK DETECTION ────────────────────────────────────
   for (let i = 0; i < hands.length; i++) {
     const h = hands[i];
-    if (h.pinching) {
-      prevTips[i] = null;
-      continue;  // don't pluck while pinching
-    }
+    if (h.pinching) { prevTips[i] = null; continue; }
 
     const lm = h.lm;
     const tips = [
-      { x: lm[8].x * W, y: lm[8].y * H },   // index
-      { x: lm[12].x * W, y: lm[12].y * H },  // middle
+      { x: lm[8].x * W, y: lm[8].y * H },
+      { x: lm[12].x * W, y: lm[12].y * H },
     ];
 
     const prev = prevTips[i];
@@ -394,11 +470,12 @@ function processHands(allLandmarks) {
           if (now - s.lastPluck < PLUCK_COOLDOWN) continue;
           const hit = segHit(prev[k], tips[k], s.a, s.b);
           if (hit) {
-            const vel = clamp(dist(prev[k], tips[k]) / 40, 0.2, 1.0);
+            const vel = clamp(dist(prev[k], tips[k]) / 35, 0.2, 1.0);
             s.lastPluck = now;
             s.vib = vel;
             playNote(s.midi, vel);
-            spark(hit, Math.round(8 + vel * 25), s.hue);
+            emitSparks(hit, Math.round(15 + vel * 40), s.hue);
+            emitRipple(hit, s.hue);
             showNote(midiName(s.midi), s.hue);
           }
         }
@@ -407,7 +484,6 @@ function processHands(allLandmarks) {
     prevTips[i] = tips;
   }
 
-  // Clean up stale tips
   for (const k of Object.keys(prevTips)) {
     if (+k >= hands.length) delete prevTips[k];
   }
@@ -417,170 +493,320 @@ function processHands(allLandmarks) {
 
 
 // ═══════════════════════════════════════════════════════════════
-//  SPARK PARTICLES
-// ═══════════════════════════════════════════════════════════════
-
-function spark(pt, count, hue) {
-  for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 2 + Math.random() * 7;
-    sparks.push({
-      x: pt.x, y: pt.y,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed - 2,
-      life: 1, hue,
-    });
-  }
-}
-
-
-// ═══════════════════════════════════════════════════════════════
-//  RENDERING
+//  RENDERING — Multi-layer glow pipeline
 // ═══════════════════════════════════════════════════════════════
 
 function draw(hands) {
   const now = performance.now();
   ctx.clearRect(0, 0, W, H);
+  gctx.clearRect(0, 0, W, H);
 
-  // ── Strings ─────────────────────────────────────────────
+  // ── Ambient floating particles ─────────────────────────
+  drawAmbient(now);
+
+  // ── Strings (3-layer glow) ─────────────────────────────
   for (const s of strings) {
-    s.vib *= 0.94;
-    if (s.vib < 0.005) s.vib = 0;
-
-    const dx = s.b.x - s.a.x, dy = s.b.y - s.a.y;
-    const L = s.L || 1;
-    const nx = -dy / L, ny = dx / L;
-    const v = s.vib;
-    const segs = 40;
-
-    // Glow pass
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.strokeStyle = `hsla(${s.hue},100%,55%,${0.12 + v * 0.25})`;
-    ctx.shadowColor = `hsl(${s.hue},100%,50%)`;
-    ctx.shadowBlur = 6 + v * 30;
-    ctx.lineWidth = 2.5 + v * 5;
-    ctx.beginPath();
-    for (let i = 0; i <= segs; i++) {
-      const t = i / segs;
-      const off = Math.sin(Math.PI * t) * v * 28 * Math.sin(now * 0.06 + t * 9);
-      const x = s.a.x + dx * t + nx * off;
-      const y = s.a.y + dy * t + ny * off;
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    }
-    ctx.stroke();
-    ctx.restore();
-
-    // Core line
-    ctx.save();
-    ctx.strokeStyle = `hsl(${s.hue},100%,${72 + v * 20}%)`;
-    ctx.shadowColor = `hsl(${s.hue},100%,60%)`;
-    ctx.shadowBlur = 3 + v * 15;
-    ctx.lineWidth = 1.5 + v * 2;
-    ctx.beginPath();
-    for (let i = 0; i <= segs; i++) {
-      const t = i / segs;
-      const off = Math.sin(Math.PI * t) * v * 28 * Math.sin(now * 0.06 + t * 9);
-      const x = s.a.x + dx * t + nx * off;
-      const y = s.a.y + dy * t + ny * off;
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    }
-    ctx.stroke();
-    ctx.restore();
-
-    // Endpoints — grabbable markers
-    for (const p of [s.a, s.b]) {
-      ctx.save();
-      ctx.fillStyle = `hsla(${s.hue},80%,70%,0.6)`;
-      ctx.shadowColor = `hsl(${s.hue},100%,55%)`;
-      ctx.shadowBlur = 8;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-      // Outer grab ring
-      ctx.strokeStyle = `hsla(${s.hue},60%,60%,0.3)`;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, GRAB_RADIUS * 0.5, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-    }
+    drawStringMultiGlow(s, now);
   }
 
-  // ── Drawing preview (dashed line between two pinching hands) ──
+  // ── Ripples ────────────────────────────────────────────
+  drawRipples();
+
+  // ── Sparks ─────────────────────────────────────────────
+  drawSparks();
+
+  // ── Drawing preview ────────────────────────────────────
   if (drawing && drawA && drawB) {
-    ctx.save();
-    ctx.setLineDash([10, 7]);
-    ctx.strokeStyle = 'rgba(255,255,255,0.45)';
-    ctx.lineWidth = 2;
-    ctx.shadowColor = 'rgba(255,255,255,0.15)';
-    ctx.shadowBlur = 8;
-    ctx.beginPath();
-    ctx.moveTo(drawA.x, drawA.y);
-    ctx.lineTo(drawB.x, drawB.y);
-    ctx.stroke();
-    // Length label
-    const L = dist(drawA, drawB);
-    const m = mid(drawA, drawB);
-    ctx.setLineDash([]);
-    ctx.font = '11px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgba(255,255,255,0.35)';
-    ctx.fillText(`${Math.round(L)}px`, m.x, m.y - 10);
-    ctx.restore();
+    drawPreview(drawA, drawB);
   }
 
-  // ── Grab indicator ──
+  // ── Grab indicator ─────────────────────────────────────
   if (grabbing && strings[grabbing.si]) {
     const s = strings[grabbing.si];
     const p = s[grabbing.ep];
     ctx.save();
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 1.5;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 14, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 16, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
   }
 
-  // ── Sparks ──────────────────────────────────────────────
+  // ── Hand skeletons ─────────────────────────────────────
+  for (const h of hands) {
+    drawHand(h.lm, h.pinching);
+  }
+}
+
+
+function drawStringMultiGlow(s, now) {
+  s.vib *= 0.935;
+  if (s.vib < 0.004) s.vib = 0;
+
+  const dx = s.b.x - s.a.x, dy = s.b.y - s.a.y;
+  const L = s.L || 1;
+  const nx = -dy / L, ny = dx / L;
+  const v = s.vib;
+  const segs = 48;
+
+  // Idle sway — gentle breathing even when not plucked
+  const idleAmp = 2.5;
+  const idleFreq = 0.0012;
+
+  function getStringPoint(t) {
+    const vibOff = Math.sin(Math.PI * t) * v * 30 * Math.sin(now * 0.055 + t * 10);
+    const idleOff = Math.sin(Math.PI * t) * idleAmp * Math.sin(now * idleFreq + s.idlePhase + t * 2);
+    const totalOff = vibOff + idleOff;
+    return {
+      x: s.a.x + dx * t + nx * totalOff,
+      y: s.a.y + dy * t + ny * totalOff,
+    };
+  }
+
+  function tracePath(c) {
+    c.beginPath();
+    for (let i = 0; i <= segs; i++) {
+      const p = getStringPoint(i / segs);
+      i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y);
+    }
+  }
+
+  // ── Layer 1: Wide outer bloom (on glow canvas for screen blending) ──
+  gctx.save();
+  gctx.strokeStyle = `hsla(${s.hue}, 100%, 50%, ${0.06 + v * 0.15})`;
+  gctx.shadowColor = `hsl(${s.hue}, 100%, 45%)`;
+  gctx.shadowBlur = 25 + v * 55;
+  gctx.lineWidth = 8 + v * 14 + s.thickness * 2;
+  gctx.lineCap = 'round';
+  tracePath(gctx);
+  gctx.stroke();
+  gctx.restore();
+
+  // ── Layer 2: Medium glow ──
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = `hsla(${s.hue}, 100%, 55%, ${0.15 + v * 0.3})`;
+  ctx.shadowColor = `hsl(${s.hue}, 100%, 50%)`;
+  ctx.shadowBlur = 10 + v * 35;
+  ctx.lineWidth = 3 + v * 6 + s.thickness;
+  ctx.lineCap = 'round';
+  tracePath(ctx);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Layer 3: Bright core line ──
+  ctx.save();
+  ctx.strokeStyle = `hsl(${s.hue}, 100%, ${78 + v * 18}%)`;
+  ctx.shadowColor = `hsl(${s.hue}, 100%, 70%)`;
+  ctx.shadowBlur = 4 + v * 18;
+  ctx.lineWidth = s.thickness + v * 2.5;
+  ctx.lineCap = 'round';
+  tracePath(ctx);
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Layer 4: White-hot center (when vibrating) ──
+  if (v > 0.1) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.strokeStyle = `rgba(255, 255, 255, ${v * 0.35})`;
+    ctx.shadowColor = '#fff';
+    ctx.shadowBlur = v * 12;
+    ctx.lineWidth = 0.8 + v * 1.5;
+    ctx.lineCap = 'round';
+    tracePath(ctx);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── Endpoints — glowing orbs with pulse ──
+  const pulse = 0.4 + 0.3 * Math.sin(now * 0.003 + s.idlePhase);
+  for (const p of [s.a, s.b]) {
+    // Outer glow
+    gctx.save();
+    const grad = gctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 20 + v * 10);
+    grad.addColorStop(0, `hsla(${s.hue}, 100%, 70%, ${0.3 + pulse * 0.2 + v * 0.3})`);
+    grad.addColorStop(1, `hsla(${s.hue}, 100%, 50%, 0)`);
+    gctx.fillStyle = grad;
+    gctx.beginPath();
+    gctx.arc(p.x, p.y, 20 + v * 10, 0, Math.PI * 2);
+    gctx.fill();
+    gctx.restore();
+
+    // Core dot
+    ctx.save();
+    ctx.fillStyle = `hsla(${s.hue}, 90%, 80%, ${0.7 + pulse * 0.3})`;
+    ctx.shadowColor = `hsl(${s.hue}, 100%, 65%)`;
+    ctx.shadowBlur = 10 + v * 15;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 4 + v * 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Outer ring
+    ctx.save();
+    ctx.strokeStyle = `hsla(${s.hue}, 70%, 65%, ${0.2 + pulse * 0.15})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 10 + pulse * 3 + v * 4, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+
+function drawSparks() {
   sparks = sparks.filter(p => p.life > 0);
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
   for (const p of sparks) {
     p.x += p.vx; p.y += p.vy;
-    p.vy += 0.28; p.life -= 0.028;
-    ctx.strokeStyle = `hsla(${p.hue},100%,80%,${p.life})`;
-    ctx.lineWidth = 1.5 * p.life;
+    p.vy += 0.22;    // gravity
+    p.vx *= 0.985;   // drag
+    p.life -= 0.022;
+
+    // Bright trail
+    ctx.strokeStyle = `hsla(${p.hue}, 100%, 85%, ${p.life * 0.9})`;
+    ctx.lineWidth = p.size * p.life;
+    ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.moveTo(p.x, p.y);
-    ctx.lineTo(p.x - p.vx * 1.8, p.y - p.vy * 1.8);
+    ctx.lineTo(p.x - p.vx * 2.5, p.y - p.vy * 2.5);
+    ctx.stroke();
+
+    // Glow dot at head
+    ctx.fillStyle = `hsla(${p.hue}, 100%, 95%, ${p.life})`;
+    ctx.shadowColor = `hsl(${p.hue}, 100%, 70%)`;
+    ctx.shadowBlur = 6 * p.life;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.restore();
+}
+
+
+function drawRipples() {
+  ripples = ripples.filter(r => r.life > 0);
+  ctx.save();
+  for (const r of ripples) {
+    r.radius += (r.maxRadius - r.radius) * 0.08;
+    r.life -= 0.025;
+    ctx.strokeStyle = `hsla(${r.hue}, 100%, 70%, ${r.life * 0.4})`;
+    ctx.lineWidth = 1.5 * r.life;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.radius, 0, Math.PI * 2);
     ctx.stroke();
   }
   ctx.restore();
+}
 
-  // ── Hand skeletons ─────────────────────────────────────
-  for (const h of hands) {
-    const lm = h.lm;
-    // Bones
-    ctx.strokeStyle = 'rgba(80,230,160,0.5)';
-    ctx.lineWidth = 2;
-    for (const [a, b] of CONN) {
-      ctx.beginPath();
-      ctx.moveTo(lm[a].x * W, lm[a].y * H);
-      ctx.lineTo(lm[b].x * W, lm[b].y * H);
-      ctx.stroke();
-    }
-    // Joints
-    for (let j = 0; j < lm.length; j++) {
-      const isTip = j === 4 || j === 8 || j === 12 || j === 16 || j === 20;
-      ctx.fillStyle = isTip ? 'rgba(255,100,180,0.8)' : 'rgba(80,230,160,0.7)';
-      ctx.beginPath();
-      ctx.arc(lm[j].x * W, lm[j].y * H, isTip ? 4.5 : 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
+
+function drawAmbient(now) {
+  // Floating dots that react to music (get brighter when strings vibrate)
+  let totalVib = 0;
+  for (const s of strings) totalVib += s.vib;
+  const boost = Math.min(totalVib * 0.5, 0.4);
+
+  gctx.save();
+  for (const d of ambientDots) {
+    d.x += d.vx;
+    d.y += d.vy;
+    // Wrap around
+    if (d.x < 0) d.x = W;
+    if (d.x > W) d.x = 0;
+    if (d.y < 0) d.y = H;
+    if (d.y > H) d.y = 0;
+
+    gctx.fillStyle = `hsla(${d.hue}, 60%, 70%, ${d.alpha + boost})`;
+    gctx.beginPath();
+    gctx.arc(d.x, d.y, d.size + boost * 2, 0, Math.PI * 2);
+    gctx.fill();
   }
+  gctx.restore();
+}
+
+
+function drawPreview(a, b) {
+  ctx.save();
+  ctx.setLineDash([10, 7]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.shadowColor = 'rgba(255,255,255,0.15)';
+  ctx.shadowBlur = 6;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+
+  // Length + note preview
+  const L = dist(a, b);
+  const m = mid(a, b);
+  const midi = noteFor(L);
+  ctx.setLineDash([]);
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillText(`${midiName(midi)}  ${Math.round(L)}px`, m.x, m.y - 12);
+  ctx.restore();
+}
+
+
+function drawHand(lm, pinching) {
+  const P = i => ({ x: lm[i].x * W, y: lm[i].y * H });
+
+  // Bone color changes when pinching
+  const boneColor = pinching ? 'rgba(255, 200, 100, 0.5)' : 'rgba(80, 230, 160, 0.45)';
+  const jointColor = pinching ? 'rgba(255, 180, 80, 0.8)' : 'rgba(80, 230, 160, 0.65)';
+  const tipColor = pinching ? 'rgba(255, 140, 60, 0.9)' : 'rgba(255, 100, 180, 0.75)';
+  const glowColor = pinching ? 'rgba(255, 180, 80, 0.2)' : 'rgba(80, 230, 160, 0.15)';
+
+  // Bones
+  ctx.save();
+  ctx.strokeStyle = boneColor;
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.shadowColor = glowColor;
+  ctx.shadowBlur = 8;
+  for (const [a, b] of CONN) {
+    const pa = P(a), pb = P(b);
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+  }
+
+  // Joints
+  ctx.shadowBlur = 6;
+  for (let j = 0; j < lm.length; j++) {
+    const p = P(j);
+    const isTip = j === 4 || j === 8 || j === 12 || j === 16 || j === 20;
+    ctx.fillStyle = isTip ? tipColor : jointColor;
+    ctx.shadowColor = isTip ? tipColor : glowColor;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, isTip ? 4 : 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Pinch indicator — glowing circle at pinch point
+  if (pinching) {
+    const thumb = P(4), index = P(8);
+    const m = mid(thumb, index);
+    gctx.save();
+    const grad = gctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, 18);
+    grad.addColorStop(0, 'rgba(255, 220, 100, 0.4)');
+    grad.addColorStop(1, 'rgba(255, 220, 100, 0)');
+    gctx.fillStyle = grad;
+    gctx.beginPath();
+    gctx.arc(m.x, m.y, 18, 0, Math.PI * 2);
+    gctx.fill();
+    gctx.restore();
+  }
+
+  ctx.restore();
 }
 
 
@@ -588,14 +814,15 @@ function draw(hands) {
 //  MAIN LOOP
 // ═══════════════════════════════════════════════════════════════
 
+let lastDetectedHands = [];
+
 function frame() {
-  let hands = [];
   if (video.readyState >= 2 && video.currentTime !== lastT) {
     lastT = video.currentTime;
     const result = hl.detectForVideo(video, performance.now());
-    hands = processHands(result.landmarks);
+    lastDetectedHands = processHands(result.landmarks);
   }
-  draw(hands.length ? hands : []);
+  draw(lastDetectedHands);
   requestAnimationFrame(frame);
 }
 
@@ -621,13 +848,15 @@ document.getElementById('go').onclick = async () => {
 
   try {
     statusEl.textContent = 'Requesting camera...';
-    ac = new AudioContext();
+    initAudioGraph();
     video.srcObject = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }
     });
     await video.play();
-    W = canvas.width  = video.videoWidth  || 1280;
-    H = canvas.height = video.videoHeight || 720;
+    W = canvas.width  = glowCv.width  = video.videoWidth  || 1280;
+    H = canvas.height = glowCv.height = video.videoHeight || 720;
+
+    initAmbient();
 
     statusEl.textContent = 'Loading hand model...';
     const fs = await FilesetResolver.forVisionTasks(
